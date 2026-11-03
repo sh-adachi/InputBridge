@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+Vendor/
+dist/
+Diagnostics/
+.DS_Store
+Reports/*
+!Reports/.gitkeep
