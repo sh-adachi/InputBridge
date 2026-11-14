@@ -17,6 +17,7 @@ let package = Package(
         .executableTarget(name: "DDCProbe", dependencies: ["AppleSiliconDDC", "AppleSiliconDDCObjC", "BridgeCore"]),
         .executableTarget(name: "InputBridgeCLI", dependencies: ["BridgeCore"]),
         .executableTarget(name: "InputBridgeApp", dependencies: ["BridgeCore"], linkerSettings: [.linkedFramework("Carbon"), .linkedFramework("ServiceManagement")]),
-        .testTarget(name: "BridgeCoreTests", dependencies: ["BridgeCore"])
+        .testTarget(name: "BridgeCoreTests", dependencies: ["BridgeCore"]),
+        .testTarget(name: "InputBridgeAppTests", dependencies: ["InputBridgeApp", "BridgeCore"])
     ]
 )

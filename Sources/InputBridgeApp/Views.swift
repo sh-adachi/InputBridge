@@ -77,7 +77,7 @@ struct MenuContent: View {
             VStack(alignment: .leading, spacing: 5) {
                 Toggle("入力に合わせて自動切替", isOn: Binding(get: { model.preferences.automatic }, set: model.setAutomatic))
                     .toggleStyle(.switch).controlSize(.small)
-                    .disabled(model.busy || !model.automaticReady)
+                    .disabled(model.busy || (!model.automaticReady && !model.preferences.automatic))
                 HStack(alignment: .top) {
                     Text(model.automaticDescription).font(.system(size: 10)).foregroundColor(.secondary)
                     Spacer(minLength: 0)
@@ -246,7 +246,7 @@ struct SettingsContent: View {
         VStack(spacing: 18) {
             SettingsCard("自動切替", subtitle: model.automaticDescription) {
                 Toggle("入力に合わせて自動切替する", isOn: Binding(get: { model.preferences.automatic }, set: model.setAutomatic))
-                    .toggleStyle(.switch).disabled(!model.automaticReady || model.busy)
+                    .toggleStyle(.switch).disabled(model.busy || (!model.automaticReady && !model.preferences.automatic))
                 HStack(spacing: 8) {
                     Label("USB-C → デュアル", systemImage: "display.2")
                     Spacer()
@@ -270,7 +270,7 @@ struct SettingsContent: View {
                      : "無効化はUSB-Cの映像信号も止めるため、Switchを切ってもDellがHDMIのまま戻らない場合があります。")
                     .font(.system(size: 10)).foregroundColor(model.strategy == .mirror ? .secondary : .orange).lineSpacing(3)
             }
-            Text("手動操作すると自動切替はオフになります。スリープ復帰後はデュアルへ戻し、接続が安定してから新しい入力値で再判定します。")
+            Text("オンの設定はスリープ・通信エラー・手動操作でも保持します。手動操作を30秒間優先し、復帰時は接続を待ってから再判定します。エラー時は設定を保持して再試行します。")
                 .font(.system(size: 10)).foregroundColor(.secondary).lineSpacing(3).frame(maxWidth: .infinity, alignment: .leading)
         }
     }

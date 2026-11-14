@@ -17,7 +17,20 @@ struct Preferences: Codable {
     var welcomed = false
 }
 
-actor DisplayWorker {
+protocol DisplayWorking: Actor {
+    func initialize(seed: URL?) throws -> CalibrationProfile
+    func status(readInput: Bool) async throws -> RuntimeStatus
+    func single(_ strategy: HideStrategy) throws -> RuntimeStatus
+    func dual() throws -> RuntimeStatus
+    func configure() throws -> CalibrationProfile
+    func calibrate(_ input: InputSource) throws -> CalibrationProfile
+    func strategy(_ strategy: HideStrategy) throws -> CalibrationProfile
+    func heartbeat() throws
+    func profile() throws -> CalibrationProfile
+    func log(_ event: String, _ detail: String)
+}
+
+actor DisplayWorker: DisplayWorking {
     let controller: RuntimeController
     init(root: URL, executable: URL) { controller = RuntimeController(root: root, executable: executable) }
     func initialize(seed: URL?) throws -> CalibrationProfile { try controller.initialize(seed: seed) }
@@ -50,7 +63,7 @@ final class AppModel: ObservableObject {
     @Published var lastRead: Date?
     @Published var shortcutError: String?
     let root: URL
-    let worker: DisplayWorker
+    let worker: any DisplayWorking
     var showSettings: (() -> Void)?
     var onReady: (() -> Void)?
     var onQuitComplete: ((Bool) -> Void)?
@@ -63,9 +76,18 @@ final class AppModel: ObservableObject {
     private var resumeAt: TimeInterval = 0
     private var observerTokens: [NSObjectProtocol] = []
     private var quitting = false
+    private let now: () -> TimeInterval
+    private(set) var operationTask: Task<Void, Never>?
+    private(set) var recoveryPending = false
+    @Published private(set) var automaticPauseReason: String?
+    private var retryDelay: TimeInterval = 15
+    private var readGeneration = 0
+    private var wakeGeneration = 0
 
-    init() {
-        if let override = ProcessInfo.processInfo.environment["INPUTBRIDGE_DATA_DIR"] {
+    init(root suppliedRoot: URL? = nil, worker: (any DisplayWorking)? = nil,
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        if let suppliedRoot { root = suppliedRoot }
+        else if let override = ProcessInfo.processInfo.environment["INPUTBRIDGE_DATA_DIR"] {
             root = URL(fileURLWithPath: override, isDirectory: true)
         } else {
             root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("InputBridge", isDirectory: true)
@@ -73,7 +95,8 @@ final class AppModel: ObservableObject {
         preferencesURL = root.appendingPathComponent("preferences.json")
         preferences = (try? JSON.load(Preferences.self, preferencesURL)) ?? Preferences()
         let cli = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/inputbridge")
-        worker = DisplayWorker(root: root, executable: cli)
+        self.worker = worker ?? DisplayWorker(root: root, executable: cli)
+        self.now = now
     }
 
     var mode: WorkspaceMode { status?.mode ?? .unavailable }
@@ -86,9 +109,12 @@ final class AppModel: ObservableObject {
     var shortcutPrefix: String { preferences.shortcutPreset.title }
     var automaticDescription: String {
         if sleeping { return "スリープ中は監視を休止します" }
-        if preferences.automatic && ProcessInfo.processInfo.systemUptime < resumeAt { return "画面の接続が安定するまで待機中" }
+        if preferences.automatic && !initialized { return "自動切替オンを保持して接続を待っています" }
+        if preferences.automatic && !automaticReady { return "オンを保持中です。入力の登録を確認してください" }
+        if preferences.automatic, let automaticPauseReason { return automaticPauseReason }
+        if preferences.automatic && now() < resumeAt { return "オンを保持して画面の接続が安定するまで待機中" }
         if preferences.automatic { return "Dell本体の入力操作に追従します" }
-        if automaticReady { return "手動操作を優先しています" }
+        if automaticReady { return "自動切替はオフです" }
         return "USB-CとHDMIを登録すると利用できます"
     }
 
@@ -96,20 +122,32 @@ final class AppModel: ObservableObject {
         installNotifications()
         updateHotkeys()
         Task {
-            do {
-                profile = try await worker.initialize(seed: Bundle.main.url(forResource: "InitialCalibration", withExtension: "json"))
-                apply(try await worker.status())
-                initialized = true
-                if !automaticReady { preferences.automatic = false }
-                resumeAt = ProcessInfo.processInfo.systemUptime + 10
-                consensus.reset(until: resumeAt)
-                notice = "メニューバーから画面を切り替えられます。"
-            } catch { present(error) }
-            busy = false; activity = ""
+            await initializeRuntime()
             startMonitoring()
             onReady?()
             if !preferences.welcomed { preferences.welcomed = true; persist() }
         }
+    }
+
+    func initializeRuntime() async {
+        busy = true
+        let generation = readGeneration
+        do {
+            profile = try await worker.initialize(seed: Bundle.main.url(forResource: "InitialCalibration", withExtension: "json"))
+            let current = try await worker.status(readInput: true)
+            initialized = true
+            if !sleeping, generation == readGeneration { apply(current) }
+            resumeAt = max(resumeAt, now() + 10)
+            consensus.reset(until: resumeAt)
+            retryDelay = 15
+            notice = "メニューバーから画面を切り替えられます。"
+        } catch {
+            if !sleeping, generation == readGeneration {
+                present(error)
+                deferRetry("オンを保持して接続を再確認しています")
+            }
+        }
+        busy = false; activity = ""
     }
 
     private func persist() {
@@ -122,7 +160,7 @@ final class AppModel: ObservableObject {
         if readInput {
             lastValue = newStatus.value
             lastRead = Date()
-            nextRead = ProcessInfo.processInfo.systemUptime + (newStatus.readError == nil ? 5 : 15)
+            nextRead = now() + (newStatus.readError == nil ? 5 : 15)
         }
     }
 
@@ -145,44 +183,52 @@ final class AppModel: ObservableObject {
         if changed { Task { await worker.log("error", detail) } }
     }
 
-    private func disableAutomatic() {
-        preferences.automatic = false
-        consensus.reset()
-        persist()
-    }
-
     func setAutomatic(_ enabled: Bool) {
         guard !busy else { return }
         if enabled {
             guard automaticReady else { settings(.automation); return }
             errorMessage = nil; errorDetail = nil
-            resumeAt = ProcessInfo.processInfo.systemUptime + 2
+            resumeAt = now() + 2
             consensus.reset(until: resumeAt)
         } else { consensus.reset() }
         preferences.automatic = enabled
+        automaticPauseReason = nil
+        retryDelay = 15
+        readGeneration += 1
         persist()
         Task { await worker.log("automatic", enabled ? "enabled" : "disabled") }
     }
 
-    private func perform(_ title: String, manual: Bool = true, operation: @escaping @MainActor () async throws -> Void) {
-        guard !busy, !quitting else { return }
-        if manual { disableAutomatic() }
+    @discardableResult
+    private func perform(_ title: String, manual: Bool = true, operation: @escaping @MainActor () async throws -> Void) -> Task<Void, Never>? {
+        guard !busy, !quitting else { return nil }
         busy = true; activity = title; dismissError(); notice = nil
+        readGeneration += 1
         // Display notifications caused by our own transaction should only reset fresh samples.
-        resumeAt = max(resumeAt, ProcessInfo.processInfo.systemUptime + (manual ? 10 : 15))
+        resumeAt = max(resumeAt, now() + (manual ? 30 : 15))
+        if manual, preferences.automatic { automaticPauseReason = "オンを保持して手動操作を30秒間優先します" }
         consensus.reset(until: resumeAt)
-        Task {
+        let generation = wakeGeneration
+        let task = Task {
             do {
                 try await operation()
-                apply(try await worker.status())
+                // The operation can span sleep; never consume its old input result.
+                if !sleeping, generation == wakeGeneration {
+                    let current = try await worker.status(readInput: true)
+                    if !sleeping, generation == wakeGeneration { apply(current) }
+                }
             } catch {
-                preferences.automatic = false; persist()
                 if let stored = try? await worker.profile() { profile = stored }
-                if let current = try? await worker.status(readInput: false) { apply(current, readInput: false) }
-                present(error)
+                if !sleeping, generation == wakeGeneration {
+                    recoveryPending = true
+                    present(error)
+                    deferRetry("オンを保持して画面の復旧を再試行します")
+                }
             }
             busy = false; activity = ""
         }
+        operationTask = task
+        return task
     }
 
     func single() {
@@ -248,91 +294,151 @@ final class AppModel: ObservableObject {
     private func startMonitoring() {
         heartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                do { try await Task.sleep(nanoseconds: 3_000_000_000) } catch { return }
                 guard let self else { return }
                 do { try await self.worker.heartbeat() } catch {
-                    if !self.busy, !self.sleeping { self.stopAutomatic("復旧監視を確認できなかったため、デュアル構成へ戻しました。") }
-                    else { self.present(error) }
+                    guard !self.busy, !self.sleeping, !self.quitting,
+                          !self.recoveryPending, self.now() >= self.resumeAt else { continue }
+                    self.recoveryPending = true
+                    self.present(error)
+                    self.deferRetry("オンを保持して復旧監視を再確認しています")
                 }
             }
         }
         monitorTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { return }
                 guard let self else { return }
-                guard !self.busy, !self.sleeping, !self.quitting, self.initialized else { continue }
-                let now = ProcessInfo.processInfo.systemUptime
-                guard now >= self.resumeAt else { continue }
-                let readInput = self.preferences.automatic || now >= self.nextRead
-                do {
-                    let current = try await self.worker.status(readInput: readInput)
-                    // An input callback/manual action may have started while this read was running.
-                    guard !self.busy, !self.sleeping, !self.quitting else { continue }
-                    self.apply(current, readInput: readInput)
-                    guard self.preferences.automatic, readInput, let profile = self.profile else { continue }
-                    guard current.protected, current.mode != .unavailable else { self.stopAutomatic("ZOWIEの表示またはDellの接続状態が変わったため、自動切替を停止しました。"); continue }
-                    let decision = self.consensus.ingest(value: current.value, profile: profile, at: ProcessInfo.processInfo.systemUptime)
-                    switch decision {
-                    case .wait: break
-                    case .unreadable: self.stopAutomatic("Dellの入力を読み取れなくなったため、自動切替を停止しました。")
-                    case .unknown: self.stopAutomatic("未登録の入力値が続いたため、自動切替を停止しました。入力を再登録してください。")
-                    case .input(let source):
-                        let needsSwitch = source == .usbC ? current.mode != .dual : current.mode == .dual
-                        if needsSwitch {
-                            self.consensus.didSwitch(at: ProcessInfo.processInfo.systemUptime)
-                            self.perform("入力に合わせて切り替えています…", manual: false) {
-                                if source == .usbC { self.apply(try await self.worker.dual(), readInput: false) }
-                                else { self.apply(try await self.worker.single(profile.strategy), readInput: false) }
-                            }
-                        }
-                    }
-                } catch {
-                    if self.preferences.automatic { self.stopAutomatic("接続状態を確認できなくなったため、自動切替を停止しました。") }
-                    else { self.present(error) }
-                }
+                await self.pollOnce()
             }
         }
     }
 
-    private func stopAutomatic(_ reason: String) {
-        disableAutomatic()
-        perform("デュアル構成へ復旧しています…", manual: false) {
-            self.apply(try await self.worker.dual(), readInput: false)
-            self.errorMessage = reason; self.errorDetail = nil
-            await self.worker.log("automatic-stopped", reason)
+    // This schedules a retry; it never changes the user's saved on/off choice.
+    private func deferRetry(_ reason: String) {
+        let changed = automaticPauseReason != reason
+        if preferences.automatic { automaticPauseReason = reason }
+        resumeAt = max(resumeAt, now() + retryDelay)
+        retryDelay = min(retryDelay * 2, 60)
+        readGeneration += 1
+        consensus.reset(until: resumeAt)
+        if changed { Task { await worker.log("automatic-waiting", reason) } }
+    }
+
+    func pollOnce() async {
+        guard !busy, !sleeping, !quitting, now() >= resumeAt else { return }
+        if !initialized { await initializeRuntime(); return }
+        if recoveryPending { await recoverWhenReady(); return }
+        let readInput = preferences.automatic || now() >= nextRead
+        let generation = readGeneration
+        do {
+            let current = try await worker.status(readInput: readInput)
+            // Sleep, screen changes and manual operations invalidate in-flight reads.
+            guard !busy, !sleeping, !quitting, generation == readGeneration else { return }
+            apply(current, readInput: readInput)
+            guard preferences.automatic, readInput, let profile, profile.ready else { return }
+            guard current.protected, current.mode != .unavailable else {
+                recoveryPending = true
+                deferRetry("オンを保持してディスプレイの再接続を待っています")
+                return
+            }
+            switch consensus.ingest(value: current.value, profile: profile, at: now()) {
+            case .wait: break
+            case .unreadable:
+                recoveryPending = true
+                deferRetry("オンを保持してDellの入力通信を再確認しています")
+            case .unknown:
+                recoveryPending = true
+                deferRetry("オンを保持中です。未登録の入力を再確認しています")
+            case .input(let source):
+                automaticPauseReason = nil
+                retryDelay = 15
+                dismissError()
+                let needsSwitch = source == .usbC ? current.mode != .dual : current.mode == .dual
+                if needsSwitch {
+                    consensus.didSwitch(at: now())
+                    let task = perform("入力に合わせて切り替えています…", manual: false) {
+                        if source == .usbC { _ = try await self.worker.dual() }
+                        else { _ = try await self.worker.single(profile.strategy) }
+                    }
+                    await task?.value
+                }
+            }
+        } catch {
+            guard !busy, !sleeping, !quitting, generation == readGeneration else { return }
+            present(error)
+            if preferences.automatic {
+                recoveryPending = true
+                deferRetry("オンを保持して接続状態を再確認しています")
+            }
         }
+    }
+
+    private func recoverWhenReady() async {
+        busy = true; activity = "接続が安定した画面を復旧しています…"
+        let generation = wakeGeneration
+        do {
+            let current = try await worker.dual()
+            if !sleeping, !quitting, generation == wakeGeneration {
+                apply(current, readInput: false)
+                recoveryPending = false
+                // Require fresh input readings after the recovery transaction settles.
+                resumeAt = max(resumeAt, now() + 10)
+                consensus.reset(until: resumeAt)
+                await worker.log("automatic-recovered", "Saved on/off preference retained; fresh input readings required")
+            }
+        } catch {
+            if !sleeping, !quitting, generation == wakeGeneration {
+                present(error)
+                deferRetry("オンを保持して画面の復旧を再試行します")
+            }
+        }
+        busy = false; activity = ""
     }
 
     private func installNotifications() {
         let center = NSWorkspace.shared.notificationCenter
-        observerTokens.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.sleeping = true; self?.consensus.reset() }
-        })
-        observerTokens.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.didWake() }
-        })
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification] {
+            observerTokens.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.didSleep() }
+            })
+        }
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
+            observerTokens.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.didWake() }
+            })
+        }
         observerTokens.append(NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                self.resumeAt = max(self.resumeAt, ProcessInfo.processInfo.systemUptime + 10)
-                self.consensus.reset(until: self.resumeAt)
-                await self.worker.log("display-change", "Waiting for displays to settle")
-            }
+            Task { @MainActor in self?.screenParametersChanged() }
         })
         observerTokens.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.loginStatus = SMAppService.mainApp.status }
         })
     }
-    private func didWake() {
+    func didSleep() {
+        sleeping = true
+        readGeneration += 1; wakeGeneration += 1
+        consensus.reset()
+        lastValue = nil
+        Task { await worker.log("sleep", "Monitoring paused; saved on/off preference retained") }
+    }
+
+    func didWake() {
         sleeping = false
-        resumeAt = ProcessInfo.processInfo.systemUptime + 10
+        readGeneration += 1; wakeGeneration += 1
+        recoveryPending = true
+        resumeAt = max(resumeAt, now() + 20)
         consensus.reset(until: resumeAt)
-        guard !busy, initialized else { return }
-        perform("スリープ復帰後の画面を確認しています…", manual: false) {
-            self.apply(try await self.worker.dual(), readInput: false)
-            self.resumeAt = ProcessInfo.processInfo.systemUptime + 10
-            self.consensus.reset(until: self.resumeAt)
-        }
+        lastValue = nil
+        if preferences.automatic { automaticPauseReason = "オンを保持してスリープ復帰後の接続を待っています" }
+        Task { await worker.log("wake", "Waiting before recovery; saved on/off preference retained") }
+    }
+
+    func screenParametersChanged() {
+        readGeneration += 1
+        resumeAt = max(resumeAt, now() + 10)
+        consensus.reset(until: resumeAt)
+        Task { await worker.log("display-change", "Waiting for displays to settle") }
     }
 
     func prepareToQuit() {
@@ -340,7 +446,7 @@ final class AppModel: ObservableObject {
         guard !busy else { errorMessage = "操作が完了してから終了してください。"; onQuitComplete?(false); return }
         quitting = true; busy = true; activity = "元の構成へ戻して終了しています…"
         // Quitting pauses the worker, but the user's automatic-mode preference
-        // must survive relaunch/login. Manual display actions still turn it off.
+        // must survive relaunch/login and temporary failures.
         consensus.reset()
         Task {
             do {
