@@ -218,7 +218,7 @@ struct SettingsContent: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(model.mode.title).font(.system(size: 16, weight: .semibold))
-                        Text("保存した配置で、ZOWIEがメイン画面").font(.system(size: 11)).foregroundColor(.secondary)
+                        Text("\(model.status?.mainDisplay?.title ?? "確認中")がメイン画面").font(.system(size: 11)).foregroundColor(.secondary)
                     }
                     Spacer()
                     if let hz = model.status?.zowieHz { Text("ZOWIE \(Int(hz.rounded())) Hz").font(.system(size: 10, weight: .medium)).padding(7).background(Color.green.opacity(0.09), in: Capsule()) }
@@ -253,6 +253,21 @@ struct SettingsContent: View {
                     Label(model.strategy == .mirror ? "HDMI → ZOWIEのみ（複製）" : "HDMI → ZOWIEのみ", systemImage: "display")
                 }.font(.system(size: 10)).foregroundColor(.secondary)
                 statusRow("現在のDellの入力", value: model.inputTitle)
+                Divider()
+                Toggle("使用できる画面を自動でメインにする", isOn: Binding(get: { model.preferences.automaticMainDisplay }, set: model.setAutomaticMainDisplay))
+                    .toggleStyle(.switch).disabled(model.busy)
+                Text("Dellを優先し、別の入力・電源オフ・通信不明のときはMacで使用できるZOWIEを確認して切り替えます。どちらも確認できない場合は待機します。初回はMacが映るZOWIEの入力を登録します。")
+                    .font(.system(size: 10)).foregroundColor(.secondary).lineSpacing(3)
+                if let availability = model.mainAvailability {
+                    statusRow("Dellの使用状態", value: availability.dell.title)
+                    statusRow("ZOWIEの使用状態", value: availability.zowie.title)
+                }
+                if model.preferences.automaticMainDisplay {
+                    Button("ZOWIEのMac入力を再登録", action: model.registerMainInput)
+                        .controlSize(.small).disabled(model.busy || !model.initialized)
+                    Text("入力端子を変えた場合は、ZOWIEにMacを表示してから再登録してください。")
+                        .font(.system(size: 10)).foregroundColor(.secondary)
+                }
             }
             SettingsCard("入力を登録", subtitle: "Dell本体を対象の入力に切り替えてから登録します。約10秒間Dellのみを非表示にして、通信と元の配置への復帰を確認します。") {
                 calibrationRow(.usbC, point: model.profile?.usbC)
@@ -317,7 +332,8 @@ struct SettingsContent: View {
     private var diagnostics: some View {
         VStack(spacing: 18) {
             SettingsCard("ディスプレイ") {
-                statusRow("ZOWIE XL2546K", value: model.status?.protected == true ? "メイン画面 · 保護中" : "接続・メイン画面を確認")
+                statusRow("メイン画面", value: model.status?.mainDisplay?.title ?? "確認中")
+                statusRow("ZOWIE XL2546K", value: model.status?.protected == true ? "表示継続 · 保護中" : "接続を確認")
                 statusRow("Dell S2725QC", value: model.mode == .dual ? "拡張表示" : model.mode == .single ? "非表示" : model.mode == .mirrored ? "ZOWIEの複製" : "未確認")
                 statusRow("Dellの入力", value: model.inputTitle)
                 if let value = model.lastValue { statusRow("入力値", value: String(format: "0x%04X", value)) }

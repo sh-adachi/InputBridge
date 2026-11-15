@@ -53,10 +53,10 @@ public struct VCPReading: Codable, Equatable {
     public var current: UInt16?
     public var maximum: UInt16?
 
-    public init(device: DDCDevice, raw: [UInt8], transportOK: Bool) {
+    public init(device: DDCDevice, raw: [UInt8], transportOK: Bool, feature: UInt8 = 0x60) {
         self.device = device
         self.raw = raw
-        let reason = Self.validate(raw: raw, transportOK: transportOK)
+        let reason = Self.validate(raw: raw, transportOK: transportOK, feature: feature)
         valid = reason == nil
         error = reason
         if valid {
@@ -65,11 +65,11 @@ public struct VCPReading: Codable, Equatable {
         }
     }
 
-    public static func validate(raw: [UInt8], transportOK: Bool) -> String? {
+    public static func validate(raw: [UInt8], transportOK: Bool, feature: UInt8 = 0x60) -> String? {
         guard transportOK else { return "I2C transport failed" }
         guard raw.count == 11 else { return "Unexpected reply size" }
         guard raw[0] == 0x6e, raw[1] == 0x88 else { return "Invalid DDC reply header/length" }
-        guard raw[2] == 0x02, raw[3] == 0x00, raw[4] == 0x60 else {
+        guard raw[2] == 0x02, raw[3] == 0x00, raw[4] == feature else {
             return "Unsupported VCP or unexpected opcode/result/feature"
         }
         guard raw[5] == 0 || raw[5] == 1 else { return "Invalid VCP type" }

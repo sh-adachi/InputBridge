@@ -15,6 +15,18 @@ struct Preferences: Codable {
     var shortcuts = true
     var shortcutPreset: ShortcutPreset = .controlOptionCommand
     var welcomed = false
+    var automaticMainDisplay = false
+
+    init() {}
+    private enum CodingKeys: String, CodingKey { case automatic, shortcuts, shortcutPreset, welcomed, automaticMainDisplay }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        automatic = try values.decodeIfPresent(Bool.self, forKey: .automatic) ?? false
+        shortcuts = try values.decodeIfPresent(Bool.self, forKey: .shortcuts) ?? true
+        shortcutPreset = try values.decodeIfPresent(ShortcutPreset.self, forKey: .shortcutPreset) ?? .controlOptionCommand
+        welcomed = try values.decodeIfPresent(Bool.self, forKey: .welcomed) ?? false
+        automaticMainDisplay = try values.decodeIfPresent(Bool.self, forKey: .automaticMainDisplay) ?? false
+    }
 }
 
 protocol DisplayWorking: Actor {
@@ -22,6 +34,9 @@ protocol DisplayWorking: Actor {
     func status(readInput: Bool) async throws -> RuntimeStatus
     func single(_ strategy: HideStrategy) throws -> RuntimeStatus
     func dual() throws -> RuntimeStatus
+    func mainDisplay(_ target: MainDisplay) throws -> RuntimeStatus
+    func mainAvailability(dellInput: UInt16?) throws -> MainAvailability
+    func registerMainInput() throws -> CalibrationProfile
     func configure() throws -> CalibrationProfile
     func calibrate(_ input: InputSource) throws -> CalibrationProfile
     func strategy(_ strategy: HideStrategy) throws -> CalibrationProfile
@@ -37,6 +52,9 @@ actor DisplayWorker: DisplayWorking {
     func status(readInput: Bool = true) throws -> RuntimeStatus { try controller.status(readInput: readInput) }
     func single(_ strategy: HideStrategy) throws -> RuntimeStatus { try controller.switchToSingle(strategy: strategy) }
     func dual() throws -> RuntimeStatus { try controller.restoreDual() }
+    func mainDisplay(_ target: MainDisplay) throws -> RuntimeStatus { try controller.setMainDisplay(target) }
+    func mainAvailability(dellInput: UInt16?) throws -> MainAvailability { try controller.mainAvailability(dellInput: dellInput) }
+    func registerMainInput() throws -> CalibrationProfile { try controller.registerMainInput() }
     func configure() throws -> CalibrationProfile { try controller.refreshConfiguration() }
     func calibrate(_ input: InputSource) throws -> CalibrationProfile { try controller.calibrate(input) }
     func strategy(_ strategy: HideStrategy) throws -> CalibrationProfile { try controller.saveStrategy(strategy) }
@@ -61,6 +79,7 @@ final class AppModel: ObservableObject {
     @Published var loginStatus: SMAppService.Status = SMAppService.mainApp.status
     @Published var lastValue: UInt16?
     @Published var lastRead: Date?
+    @Published private(set) var mainAvailability: MainAvailability?
     @Published var shortcutError: String?
     let root: URL
     let worker: any DisplayWorking
@@ -72,6 +91,8 @@ final class AppModel: ObservableObject {
     private var monitorTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
     private var consensus = InputConsensus()
+    private var mainConsensus = MainDisplayConsensus()
+    private var nextMainCheck: TimeInterval = 0
     private var nextRead: TimeInterval = 0
     private var resumeAt: TimeInterval = 0
     private var observerTokens: [NSObjectProtocol] = []
@@ -139,6 +160,8 @@ final class AppModel: ObservableObject {
             if !sleeping, generation == readGeneration { apply(current) }
             resumeAt = max(resumeAt, now() + 10)
             consensus.reset(until: resumeAt)
+            mainConsensus.reset()
+            nextMainCheck = 0
             retryDelay = 15
             notice = "メニューバーから画面を切り替えられます。"
         } catch {
@@ -176,7 +199,7 @@ final class AppModel: ObservableObject {
         } else if detail.contains("absent") || detail.contains("unavailable") || detail.contains("Display") {
             errorMessage = "Dellの復帰を確認できませんでした。USB-Cを抜き差ししてから「Dellを復旧」を実行してください。"
         } else if detail.contains("main display") || detail.contains("ZOWIE") {
-            errorMessage = "ZOWIEを有効なメイン画面にしてから再試行してください。"
+            errorMessage = "ZOWIEの接続と表示状態を確認してから再試行してください。"
         } else if detail.contains("Another diagnostic") {
             errorMessage = "別の操作が実行中です。少し待ってから再試行してください。"
         } else { errorMessage = "操作を完了できませんでした。診断画面で詳細を確認できます。" }
@@ -190,6 +213,8 @@ final class AppModel: ObservableObject {
             errorMessage = nil; errorDetail = nil
             resumeAt = now() + 2
             consensus.reset(until: resumeAt)
+            mainConsensus.reset()
+            nextMainCheck = 0
         } else { consensus.reset() }
         preferences.automatic = enabled
         automaticPauseReason = nil
@@ -197,6 +222,29 @@ final class AppModel: ObservableObject {
         readGeneration += 1
         persist()
         Task { await worker.log("automatic", enabled ? "enabled" : "disabled") }
+    }
+
+    func setAutomaticMainDisplay(_ enabled: Bool) {
+        guard !busy else { return }
+        perform("メイン画面の自動切替を設定しています…", manual: false) {
+            if enabled, self.profile?.zowieMacInput?.verified != true {
+                self.profile = try await self.worker.registerMainInput()
+            }
+            self.preferences.automaticMainDisplay = enabled
+            self.persist()
+            self.nextMainCheck = 0
+            self.mainAvailability = nil
+            self.notice = enabled ? "Dellを優先し、使用できないときは確認できたZOWIEへ切り替えます。" : "保存したメイン画面を使用します。"
+        }
+    }
+
+    func registerMainInput() {
+        perform("ZOWIEのMac入力を登録しています…", manual: false) {
+            self.profile = try await self.worker.registerMainInput()
+            self.mainAvailability = nil
+            self.nextMainCheck = 0
+            self.notice = "ZOWIEのMac入力と電源状態を登録しました。"
+        }
     }
 
     @discardableResult
@@ -208,6 +256,8 @@ final class AppModel: ObservableObject {
         resumeAt = max(resumeAt, now() + (manual ? 30 : 15))
         if manual, preferences.automatic { automaticPauseReason = "オンを保持して手動操作を30秒間優先します" }
         consensus.reset(until: resumeAt)
+        mainConsensus.reset()
+        nextMainCheck = 0
         let generation = wakeGeneration
         let task = Task {
             do {
@@ -236,7 +286,15 @@ final class AppModel: ObservableObject {
         perform("Dellを非表示にしています…") { self.apply(try await self.worker.single(self.strategy), readInput: false); self.notice = "ZOWIEのみで作業できます。" }
     }
     func dual() {
-        perform("デュアル構成に戻しています…") { self.apply(try await self.worker.dual(), readInput: false); self.initialized = true; self.notice = "元の配置に戻しました。" }
+        perform("デュアル構成に戻しています…") {
+            self.apply(try await self.worker.dual(), readInput: false)
+            if self.preferences.automaticMainDisplay {
+                let current = try await self.worker.status(readInput: true)
+                let available = try await self.worker.mainAvailability(dellInput: current.value)
+                if let target = available.preferred { self.apply(try await self.worker.mainDisplay(target), readInput: false) }
+            }
+            self.initialized = true; self.notice = "元の配置に戻しました。"
+        }
     }
     func configure() {
         perform("接続情報と現在の配置を保存しています…") {
@@ -322,6 +380,8 @@ final class AppModel: ObservableObject {
         retryDelay = min(retryDelay * 2, 60)
         readGeneration += 1
         consensus.reset(until: resumeAt)
+        mainConsensus.reset()
+        nextMainCheck = 0
         if changed { Task { await worker.log("automatic-waiting", reason) } }
     }
 
@@ -337,6 +397,27 @@ final class AppModel: ObservableObject {
             guard !busy, !sleeping, !quitting, generation == readGeneration else { return }
             apply(current, readInput: readInput)
             guard preferences.automatic, readInput, let profile, profile.ready else { return }
+            if preferences.automaticMainDisplay, now() >= nextMainCheck {
+                let availability = try await worker.mainAvailability(dellInput: current.value)
+                guard !busy, !sleeping, !quitting, generation == readGeneration else { return }
+                mainAvailability = availability
+                nextMainCheck = now() + 5
+                if let target = mainConsensus.ingest(availability.preferred, at: now()),
+                   current.mode == .dual, current.mainDisplay != target {
+                    let task = perform("使用できる画面をメインにしています…", manual: false) {
+                        _ = try await self.worker.mainDisplay(target)
+                    }
+                    await task?.value
+                    return
+                }
+            }
+            if preferences.automaticMainDisplay, let available = mainAvailability {
+                // Keep monitoring the usable screen without re-enabling or restoring
+                // an off/unreachable monitor merely because it disappeared from Quartz.
+                if available.zowie == .available,
+                   [.poweredOff, .disconnected, .unknown].contains(available.dell) { return }
+                if available.dell == .available, available.zowie != .available { return }
+            }
             guard current.protected, current.mode != .unavailable else {
                 recoveryPending = true
                 deferRetry("オンを保持してディスプレイの再接続を待っています")
@@ -345,20 +426,41 @@ final class AppModel: ObservableObject {
             switch consensus.ingest(value: current.value, profile: profile, at: now()) {
             case .wait: break
             case .unreadable:
+                // Power-off may also remove DDC. Allow the independent main-display
+                // checks to confirm the usable fallback before restoring a layout.
+                if preferences.automaticMainDisplay, current.mode == .dual,
+                   let target = mainAvailability?.preferred, target != current.mainDisplay { return }
                 recoveryPending = true
                 deferRetry("オンを保持してDellの入力通信を再確認しています")
             case .unknown:
+                if preferences.automaticMainDisplay, current.mode == .dual,
+                   let target = mainAvailability?.preferred, target != current.mainDisplay { return }
                 recoveryPending = true
                 deferRetry("オンを保持中です。未登録の入力を再確認しています")
             case .input(let source):
                 automaticPauseReason = nil
                 retryDelay = 15
                 dismissError()
+                if preferences.automaticMainDisplay {
+                    guard mainAvailability?.preferred != nil,
+                          source != .hdmi || mainAvailability?.zowie == .available else {
+                        deferRetry("オンを保持してMacで使用できる画面を待っています")
+                        return
+                    }
+                }
                 let needsSwitch = source == .usbC ? current.mode != .dual : current.mode == .dual
                 if needsSwitch {
                     consensus.didSwitch(at: now())
                     let task = perform("入力に合わせて切り替えています…", manual: false) {
-                        if source == .usbC { _ = try await self.worker.dual() }
+                        if source == .usbC {
+                            if current.mode != .dual { _ = try await self.worker.dual() }
+                            if self.preferences.automaticMainDisplay {
+                                let restored = try await self.worker.status(readInput: true)
+                                let available = try await self.worker.mainAvailability(dellInput: restored.value)
+                                self.mainAvailability = available
+                                if let target = available.preferred { _ = try await self.worker.mainDisplay(target) }
+                            }
+                        }
                         else { _ = try await self.worker.single(profile.strategy) }
                     }
                     await task?.value
@@ -385,6 +487,8 @@ final class AppModel: ObservableObject {
                 // Require fresh input readings after the recovery transaction settles.
                 resumeAt = max(resumeAt, now() + 10)
                 consensus.reset(until: resumeAt)
+                mainConsensus.reset()
+                nextMainCheck = 0
                 await worker.log("automatic-recovered", "Saved on/off preference retained; fresh input readings required")
             }
         } catch {
@@ -419,7 +523,10 @@ final class AppModel: ObservableObject {
         sleeping = true
         readGeneration += 1; wakeGeneration += 1
         consensus.reset()
+        mainConsensus.reset()
+        nextMainCheck = 0
         lastValue = nil
+        mainAvailability = nil
         Task { await worker.log("sleep", "Monitoring paused; saved on/off preference retained") }
     }
 
@@ -429,7 +536,10 @@ final class AppModel: ObservableObject {
         recoveryPending = true
         resumeAt = max(resumeAt, now() + 20)
         consensus.reset(until: resumeAt)
+        mainConsensus.reset()
+        nextMainCheck = 0
         lastValue = nil
+        mainAvailability = nil
         if preferences.automatic { automaticPauseReason = "オンを保持してスリープ復帰後の接続を待っています" }
         Task { await worker.log("wake", "Waiting before recovery; saved on/off preference retained") }
     }
@@ -438,6 +548,8 @@ final class AppModel: ObservableObject {
         readGeneration += 1
         resumeAt = max(resumeAt, now() + 10)
         consensus.reset(until: resumeAt)
+        mainConsensus.reset()
+        nextMainCheck = 0
         Task { await worker.log("display-change", "Waiting for displays to settle") }
     }
 
@@ -448,6 +560,8 @@ final class AppModel: ObservableObject {
         // Quitting pauses the worker, but the user's automatic-mode preference
         // must survive relaunch/login and temporary failures.
         consensus.reset()
+        mainConsensus.reset()
+        nextMainCheck = 0
         Task {
             do {
                 if FileManager.default.fileExists(atPath: root.appendingPathComponent("recovery.json").path) { _ = try await worker.dual() }

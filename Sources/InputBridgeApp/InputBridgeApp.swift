@@ -125,7 +125,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
     @objc private func showAbout() {
-        NSApp.orderFrontStandardAboutPanel(options: [.credits: NSAttributedString(string: "Mac miniと2台のディスプレイのために。\nMIT License · AppleSiliconDDC by @waydabber\n\nディスプレイの設定操作はDellだけに限定しています。")])
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: NSAttributedString(string: "Mac miniと2台のディスプレイのために。\nMIT License · AppleSiliconDDC by @waydabber\n\nDellの非表示とメイン画面の切替に対応し、ZOWIEの表示を保護します。")])
         NSApp.activate(ignoringOtherApps: true)
     }
 

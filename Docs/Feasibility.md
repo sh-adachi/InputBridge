@@ -114,3 +114,13 @@ current = 0x0011, maximum = 0x0011
 InputBridgeはApp Store向けのサンドボックスアプリではなく、ローカル配布を想定します。
 IOAVServiceおよびCGSの非公開APIを含むため、OS更新の互換性は実機テストで確認する必要があります。
 AppleSiliconDDCはMITで無償利用できます。有料BetterDisplayや追加ハードウェアには依存しません。
+
+## メイン画面の自動切替（1.0.4）
+
+[AppleのQuartz Display Services](https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/QuartzDisplayServicesConceptual/Articles/Overview.html)では、画面の原点を(0,0)に指定してメイン画面を変更できます。
+入力0x60と電源0xD6を読み、Macで使用できるDellを優先する選択肢を追加しました。Dellが別入力・電源オフ・通信不明なら、使用可能と確認したZOWIEを候補にします。どちらも確認できない場合は変更しません。HDMIでは、ZOWIEをメインへ移してからDellを非表示にします。
+原点の変更は相対配置を保った平行移動で行い、変更後に両画面のモードとZOWIEの表示継続を確認します。
+復旧処理は両画面の位置と元のメインを復元します。ZOWIEを無効化する処理は追加していません。
+対応する2台以外の有効な画面がある場合や、入力・識別情報・表示状態を確認できない場合は変更を中止します。
+
+2026-11-15の診断では両モニターとも0xD6=1（オン）の正常応答を取得し、ZOWIEのMac入力は0x0011でした。電源ボタンを切った際の応答変化は実機で別途確認が必要です。オフ後も入力と電源をオンと同じ値で返す場合は、この経路だけで識別できません。

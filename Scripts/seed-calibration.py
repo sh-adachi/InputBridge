@@ -39,7 +39,7 @@ for label, key in [('usb-c', 'usbC'), ('hdmi', 'hdmi')]:
         continue
     test = tests[-1]
     if not (test.get('mutationObserved') and test.get('restored') and test.get('ddcReadable') and not test.get('error') and
-            (test.get('protectedUnchanged') or test.get('protectedTimingAdjusted')) and
+            (test.get('protectedUnchanged') or test.get('protectedTimingAdjusted') or test.get('protectedMainAdjusted')) and
             test['before']['configuration']['dell'] == config['dell'] and
             test['before']['configuration']['ddc']['serial'] == config['ddc']['serial'] and
             test.get('readings') and all(x.get('reading', {}).get('current') == value and x.get('reading', {}).get('valid') for x in test['readings'])):

@@ -28,21 +28,22 @@ public struct Configuration: Codable {
               dell.serial != 0, zowie.serial != 0,
               ddc.manufacturer == "DEL", ddc.name == dell.name,
               ddc.numericSerial == Int64(dell.serial), !ddc.serial.isEmpty, !ddc.edid.isEmpty else {
-            throw BridgeError("Untrusted/unsupported monitor identities. Only Dell S2725QC can be changed; ZOWIE XL LCD is protected.")
+            throw BridgeError("Untrusted/unsupported monitor identities. Only the known Dell S2725QC may be hidden; ZOWIE XL LCD is protected.")
         }
     }
 }
 
 public enum Safety {
-    public static func preflight(dell: DisplayState, zowie: DisplayState) throws {
+    public static func preflight(dell: DisplayState, zowie: DisplayState, requireZowieMain: Bool = true) throws {
         guard dell.id != zowie.id, !dell.builtin, !zowie.builtin,
-              zowie.active, zowie.main, zowie.mirrorOf == 0, !zowie.inMirrorSet else {
+              zowie.active, zowie.mirrorOf == 0, !zowie.inMirrorSet,
+              requireZowieMain ? (zowie.main && !dell.main) : (zowie.main != dell.main) else {
             throw BridgeError("ZOWIE must be the active, independent main display. No changes applied.")
         }
     }
-    public static func checkProtected(_ before: DisplayState, _ after: DisplayState) throws {
-        guard before.identity.matches(after.identity), after.active, after.main, after.mirrorOf == 0,
-              before.x == after.x, before.y == after.y, before.rotation == after.rotation,
+    public static func checkProtected(_ before: DisplayState, _ after: DisplayState, allowOriginChange: Bool = false) throws {
+        guard before.identity.matches(after.identity), after.active, after.mirrorOf == 0,
+              (allowOriginChange || (before.main == after.main && before.x == after.x && before.y == after.y)), before.rotation == after.rotation,
               let old = before.mode, let new = after.mode, old.equivalent(to: new) else {
             throw BridgeError("Protected ZOWIE changed unexpectedly; restore required")
         }
@@ -60,7 +61,7 @@ public struct Recovery: Codable {
         try config.validate()
         token = UUID().uuidString; created = Date(); configuration = config; bootSession = BootSession.id
         dell = try Displays.resolve(config.dell); zowie = try Displays.resolve(config.zowie)
-        try Safety.preflight(dell: dell, zowie: zowie)
+        try Safety.preflight(dell: dell, zowie: zowie, requireZowieMain: false)
         guard dell.active, !dell.inMirrorSet, dell.rotation == 0, dell.mode != nil else {
             throw BridgeError("Start tests with Dell enabled, extended, and unrotated")
         }

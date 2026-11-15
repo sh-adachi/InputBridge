@@ -1,5 +1,53 @@
 import Foundation
 
+public enum MainDisplay: String, Codable, CaseIterable {
+    case dell, zowie
+    public var title: String { self == .dell ? "Dell" : "ZOWIE" }
+}
+
+public enum MonitorAvailability: String, Codable {
+    case available, otherInput, poweredOff, disconnected, unknown
+    public var title: String {
+        switch self {
+        case .available: return "Macで使用可能"
+        case .otherInput: return "別の入力を使用中"
+        case .poweredOff: return "電源オフ・省電力"
+        case .disconnected: return "未接続"
+        case .unknown: return "通信を確認中"
+        }
+    }
+    public static func classify(online: Bool, input: UInt16?, macInput: UInt16?, power: UInt16?) -> Self {
+        guard online else { return .disconnected }
+        if let power, (2...5).contains(power) { return .poweredOff }
+        if let input, let macInput, input != macInput { return .otherInput }
+        if let input, let macInput, input == macInput, power == 1 { return .available }
+        return .unknown
+    }
+}
+
+public struct MainAvailability: Codable, Equatable {
+    public let dell: MonitorAvailability
+    public let zowie: MonitorAvailability
+    public init(dell: MonitorAvailability, zowie: MonitorAvailability) { self.dell = dell; self.zowie = zowie }
+    public var preferred: MainDisplay? { dell == .available ? .dell : zowie == .available ? .zowie : nil }
+}
+
+/// Choose only a positively verified usable destination, after three fresh checks.
+public struct MainDisplayConsensus {
+    private var candidate: MainDisplay?
+    private var count = 0
+    private var previous: TimeInterval?
+    public init() {}
+    public mutating func reset() { candidate = nil; count = 0; previous = nil }
+    public mutating func ingest(_ target: MainDisplay?, at time: TimeInterval) -> MainDisplay? {
+        if let previous, time < previous || time - previous > 15 { reset() }
+        previous = time
+        guard let target else { candidate = nil; count = 0; return nil }
+        if candidate == target { count += 1 } else { candidate = target; count = 1 }
+        return count >= 3 ? target : nil
+    }
+}
+
 public enum InputSource: String, Codable, CaseIterable {
     case usbC = "usb-c", hdmi
     public var title: String { self == .usbC ? "USB-C" : "HDMI" }
@@ -41,6 +89,8 @@ public struct CalibrationProfile: Codable {
     public var strategy: HideStrategy
     public var usbC: CalibrationPoint?
     public var hdmi: CalibrationPoint?
+    public var zowieMacInput: CalibrationPoint?
+    public var zowieDDC: DDCDevice?
 
     public init(config: Configuration, strategy: HideStrategy = .disable) {
         schema = 1; dellUUID = config.dell.uuid; zowieUUID = config.zowie.uuid

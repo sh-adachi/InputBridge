@@ -8,7 +8,7 @@ No Swift ArgumentParser or network package resolution is needed to build InputBr
 
 The read-only helper uses AppleSiliconDDC's service discovery. Its GetVCP packet
 transport is adapted from that library, with validation of opcode, length, result,
-feature, type and checksum, and independent transport success checks. It exports
+feature (input 0x60 or power 0xD6), type and checksum, and independent transport success checks. It exports
 no SetVCP command. Each invocation exits to release IOKit resources.
 
 Display enable/disable uses the same private `CGSConfigureDisplayEnabled`

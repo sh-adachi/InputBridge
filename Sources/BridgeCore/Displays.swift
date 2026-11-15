@@ -52,7 +52,53 @@ public struct DisplayState: Codable, Equatable {
     public var enabled: Bool { active || inMirrorSet }
 }
 
+public struct DisplayPlacement: Equatable {
+    public let id: UInt32
+    public let x: Int32
+    public let y: Int32
+}
+
 public enum Displays {
+    /// Translate the entire pair, preserving relative layout in logical coordinates.
+    /// The primary is applied last at (0,0); never change enabled state or timing.
+    public static func mainDisplayLayout(_ target: MainDisplay, dell: DisplayState, zowie: DisplayState) throws -> [DisplayPlacement] {
+        try Safety.preflight(dell: dell, zowie: zowie, requireZowieMain: false)
+        guard dell.active, !dell.inMirrorSet, dell.mirrorOf == 0 else { throw BridgeError("Restore the extended Dell before changing the main display") }
+        let primary = target == .dell ? dell : zowie
+        let secondary = target == .dell ? zowie : dell
+        guard let x = Int32(exactly: Int64(secondary.x) - Int64(primary.x)),
+              let y = Int32(exactly: Int64(secondary.y) - Int64(primary.y)), x != 0 || y != 0 else {
+            throw BridgeError("Unsupported display coordinates; no changes applied")
+        }
+        return [DisplayPlacement(id: secondary.id, x: x, y: y), DisplayPlacement(id: primary.id, x: 0, y: 0)]
+    }
+
+    public static func setMainDisplay(_ target: MainDisplay, config: Configuration) throws {
+        try config.validate()
+        let dell = try resolve(config.dell), zowie = try resolve(config.zowie)
+        let placements = try mainDisplayLayout(target, dell: dell, zowie: zowie)
+        guard try list().filter({ $0.enabled }).allSatisfy({ config.dell.matches($0.identity) || config.zowie.matches($0.identity) }) else {
+            throw BridgeError("A third display is active; main display change cancelled")
+        }
+        if (target == .dell ? dell.main : zowie.main) { return }
+        try transaction { ref in
+            for position in placements {
+                try check(CGConfigureDisplayOrigin(ref, position.id, position.x, position.y), "Set main display position")
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+        let afterDell = try resolve(config.dell), afterZowie = try resolve(config.zowie)
+        try Safety.checkProtected(zowie, afterZowie, allowOriginChange: true)
+        try Safety.checkProtected(dell, afterDell, allowOriginChange: true)
+        for position in placements {
+            let current = position.id == afterDell.id ? afterDell : afterZowie
+            guard current.x == position.x, current.y == position.y,
+                  current.main == (position.id == placements.last?.id) else {
+                throw BridgeError("Main display change was not verified; restore required")
+            }
+        }
+    }
+
     public static var enableAvailable: Bool { IBEnableAvailable() }
     public static func list() throws -> [DisplayState] {
         var ids = [CGDirectDisplayID](repeating: 0, count: 32)
@@ -148,7 +194,12 @@ public enum Displays {
         try transaction { ref in
             try check(CGConfigureDisplayMirrorOfDisplay(ref, target.id, kCGNullDirectDisplay), "Unmirror Dell")
             try check(CGConfigureDisplayWithDisplayMode(ref, target.id, mode, nil), "Restore Dell mode")
-            try check(CGConfigureDisplayOrigin(ref, target.id, snapshot.dell.x, snapshot.dell.y), "Restore Dell position")
+            // Restore both origins, with the saved main display at (0,0) last.
+            let positions = snapshot.dell.main ? [snapshot.zowie, snapshot.dell] : [snapshot.dell, snapshot.zowie]
+            for display in positions {
+                let id = display.identity.matches(snapshot.configuration.dell) ? target.id : zowie.id
+                try check(CGConfigureDisplayOrigin(ref, id, display.x, display.y), "Restore display position and main")
+            }
             // A mirror set may cause the OS to change the source's timing. Restore the saved
             // source mode if necessary, but never call enabled=false for this protected display.
             if let savedZowie = snapshot.zowie.mode, zowie.mode?.equivalent(to: savedZowie) != true {

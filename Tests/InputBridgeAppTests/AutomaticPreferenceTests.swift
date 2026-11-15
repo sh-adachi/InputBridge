@@ -6,6 +6,11 @@ private actor StubDisplayWorker: DisplayWorking {
     private var calibration: CalibrationProfile
     private var value: UInt16? = 0x1b1b
     private var mode: WorkspaceMode = .dual
+    private var main: MainDisplay = .zowie
+    private var dualMain: MainDisplay = .zowie
+    private var dellPower: UInt16? = 1
+    private var zowiePower: UInt16? = 1
+    private var zowieInput: UInt16? = 0x11
     private var initializationFailures = 0
     private var restorationFailures = 0
     private var suspendNextRead = false
@@ -14,6 +19,7 @@ private actor StubDisplayWorker: DisplayWorking {
     private(set) var initializations = 0
     private(set) var restorations = 0
     private(set) var singleSwitches = 0
+    private(set) var mainSwitches = 0
 
     init(ready: Bool = true) throws {
         let dell = DisplayIdentity(uuid: "11111111-1111-4111-8111-111111111111", vendor: 0x10ac, product: 0xa272, serial: 123, name: "DELL S2725QC", location: "dell")
@@ -25,6 +31,8 @@ private actor StubDisplayWorker: DisplayWorking {
     }
 
     func setInput(_ value: UInt16?) { self.value = value }
+    func setDellPower(_ value: UInt16?) { dellPower = value }
+    func setZowiePower(_ value: UInt16?) { zowiePower = value }
     func failInitialization() { initializationFailures += 1 }
     func failRestoration() { restorationFailures += 1 }
     func suspendRead() { suspendNextRead = true }
@@ -40,7 +48,7 @@ private actor StubDisplayWorker: DisplayWorking {
 
     private func state(readInput: Bool) -> RuntimeStatus {
         RuntimeStatus(mode: mode, zowieHz: 240, dellHz: 120, protected: true,
-                      value: readInput ? value : nil, readError: readInput && value == nil ? "Temporary DDC failure" : nil)
+                      value: readInput ? value : nil, readError: readInput && value == nil ? "Temporary DDC failure" : nil, mainDisplay: main)
     }
     func initialize(seed: URL?) throws -> CalibrationProfile {
         initializations += 1
@@ -60,13 +68,27 @@ private actor StubDisplayWorker: DisplayWorking {
     func single(_ strategy: HideStrategy) throws -> RuntimeStatus {
         singleSwitches += 1
         mode = strategy == .mirror ? .mirrored : .single
+        main = .zowie
         return state(readInput: false)
     }
     func dual() throws -> RuntimeStatus {
         restorations += 1
         if restorationFailures > 0 { restorationFailures -= 1; throw BridgeError("Commit display transaction: CGError 1014") }
         mode = .dual
+        main = dualMain
         return state(readInput: false)
+    }
+    func mainDisplay(_ target: MainDisplay) throws -> RuntimeStatus {
+        mainSwitches += 1; main = target; dualMain = target
+        return state(readInput: false)
+    }
+    func registerMainInput() throws -> CalibrationProfile {
+        calibration.zowieMacInput = CalibrationPoint(value: 0x11, verified: true)
+        return calibration
+    }
+    func mainAvailability(dellInput: UInt16?) throws -> MainAvailability {
+        MainAvailability(dell: .classify(online: true, input: dellInput, macInput: 0x1b1b, power: dellPower),
+                         zowie: .classify(online: true, input: zowieInput, macInput: 0x11, power: zowiePower))
     }
     func configure() throws -> CalibrationProfile { calibration }
     func calibrate(_ input: InputSource) throws -> CalibrationProfile { calibration }
@@ -232,5 +254,94 @@ final class AutomaticPreferenceTests: XCTestCase {
         XCTAssertEqual(initializations, 2)
         XCTAssertTrue(model.initialized)
         XCTAssertTrue(model.preferences.automatic)
+    }
+
+    func testOldPreferencesRetainAutomaticOnWithNewMainOptionDefaultOff() throws {
+        let old = Data(#"{"automatic":true,"shortcuts":true,"shortcutPreset":"controlOptionCommand","welcomed":true}"#.utf8)
+        let restored = try JSONDecoder().decode(Preferences.self, from: old)
+        XCTAssertTrue(restored.automatic)
+        XCTAssertFalse(restored.automaticMainDisplay)
+        XCTAssertTrue(restored.welcomed)
+    }
+
+    func testMainDisplayFollowsUSBCAndHDMIWithoutChangingOnPreference() async throws {
+        let worker = try StubDisplayWorker(), clock = TestClock()
+        let model = try model(worker: worker, clock: clock)
+        await model.initializeRuntime()
+        model.setAutomaticMainDisplay(true)
+        await model.operationTask?.value
+        for time in [15.0, 17, 19, 21, 23, 25, 27] { clock.time = time; await model.pollOnce() }
+        XCTAssertEqual(model.status?.mainDisplay, .dell)
+        XCTAssertEqual(model.mode, .dual)
+        await worker.setInput(0x1b11)
+        for time in [42.0, 44, 46] { clock.time = time; await model.pollOnce() }
+        XCTAssertEqual(model.status?.mainDisplay, .zowie)
+        XCTAssertEqual(model.mode, .mirrored)
+        await worker.setInput(0x1b1b)
+        for time in [61.0, 63, 65] { clock.time = time; await model.pollOnce() }
+        XCTAssertEqual(model.status?.mainDisplay, .dell)
+        XCTAssertEqual(model.mode, .dual)
+        XCTAssertTrue(try savedAutomatic())
+        let preferences = try JSON.load(Preferences.self, root.appendingPathComponent("preferences.json"))
+        XCTAssertTrue(preferences.automaticMainDisplay)
+    }
+
+    func testMainDisplayStaysUnchangedWhenNewOptionIsOff() async throws {
+        let worker = try StubDisplayWorker(), clock = TestClock()
+        let model = try model(worker: worker, clock: clock)
+        await model.initializeRuntime()
+        for time in [10.0, 12, 14] { clock.time = time; await model.pollOnce() }
+        XCTAssertEqual(model.status?.mainDisplay, .zowie)
+        let changes = await worker.mainSwitches
+        XCTAssertEqual(changes, 0)
+    }
+
+    func testDellPowerOffFallsBackToZowieThenReturnsToPreferredDell() async throws {
+        let worker = try StubDisplayWorker(), clock = TestClock()
+        let model = try model(worker: worker, clock: clock)
+        await model.initializeRuntime()
+        model.setAutomaticMainDisplay(true); await model.operationTask?.value
+        for time in [15.0, 21, 27] { clock.time = time; await model.pollOnce() }
+        XCTAssertEqual(model.status?.mainDisplay, .dell)
+        await worker.setDellPower(4)
+        for time in [42.0, 48, 54] { clock.time = time; await model.pollOnce() }
+        XCTAssertEqual(model.mainAvailability?.dell, .poweredOff)
+        XCTAssertEqual(model.status?.mainDisplay, .zowie)
+        await worker.setDellPower(1)
+        for time in [69.0, 75, 81] { clock.time = time; await model.pollOnce() }
+        XCTAssertEqual(model.status?.mainDisplay, .dell)
+        XCTAssertTrue(try savedAutomatic())
+    }
+
+    func testMissingDellDDCStillAllowsConfirmedZowieFallback() async throws {
+        let worker = try StubDisplayWorker(), clock = TestClock()
+        let model = try model(worker: worker, clock: clock)
+        await model.initializeRuntime()
+        model.setAutomaticMainDisplay(true); await model.operationTask?.value
+        for time in [15.0, 17, 19, 21, 23, 25, 27] { clock.time = time; await model.pollOnce() }
+        await worker.setInput(nil); await worker.setDellPower(nil)
+        for time in [42.0, 44, 46, 48, 50, 52, 54] { clock.time = time; await model.pollOnce() }
+        XCTAssertEqual(model.mainAvailability?.dell, .unknown)
+        XCTAssertEqual(model.status?.mainDisplay, .zowie)
+        let singleSwitches = await worker.singleSwitches
+        XCTAssertEqual(singleSwitches, 0, "Unknown DDC must not be interpreted as HDMI")
+        XCTAssertTrue(try savedAutomatic())
+        let restorations = await worker.restorations
+        for time in [69.0, 71, 73, 75, 77, 79, 81, 83, 85, 87] { clock.time = time; await model.pollOnce() }
+        let laterRestorations = await worker.restorations
+        XCTAssertEqual(laterRestorations, restorations, "Do not repeatedly restore an unreachable display")
+        XCTAssertEqual(model.status?.mainDisplay, .zowie)
+    }
+
+    func testUnavailableZowieDoesNotPreventSwitchToConfirmedDell() async throws {
+        let worker = try StubDisplayWorker(), clock = TestClock()
+        let model = try model(worker: worker, clock: clock)
+        await model.initializeRuntime()
+        model.setAutomaticMainDisplay(true); await model.operationTask?.value
+        await worker.setZowiePower(4)
+        for time in [15.0, 21, 27] { clock.time = time; await model.pollOnce() }
+        XCTAssertEqual(model.status?.mainDisplay, .dell)
+        XCTAssertEqual(model.mainAvailability?.zowie, .poweredOff)
+        XCTAssertFalse(model.recoveryPending)
     }
 }

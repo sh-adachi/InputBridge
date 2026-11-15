@@ -21,6 +21,7 @@ public struct Experiment: Codable {
     public let mutationObserved: Bool
     public let protectedUnchanged: Bool
     public let protectedTimingAdjusted: Bool?
+    public let protectedMainAdjusted: Bool?
     public let ddcReadable: Bool
     public let restored: Bool
     public let error: String?
@@ -66,7 +67,7 @@ public struct Diagnostics {
         let zowies = inventory.displays.filter { $0.identity.vendor == 0x09d1 && $0.identity.name == "ZOWIE XL LCD" }
         guard dells.count == 1, zowies.count == 1 else { throw BridgeError("Exactly one S2725QC and one ZOWIE XL LCD required") }
         let dell = dells[0], zowie = zowies[0]
-        try Safety.preflight(dell: dell, zowie: zowie)
+        try Safety.preflight(dell: dell, zowie: zowie, requireZowieMain: false)
         let devices = inventory.ddcDevices.filter { $0.manufacturer == "DEL" && $0.name == dell.identity.name && $0.numericSerial == Int64(dell.identity.serial) && $0.location == dell.identity.location }
         guard devices.count == 1 else { throw BridgeError("Cannot uniquely map Dell DDC service to its display") }
         let config = try Configuration(dell: dell.identity, zowie: zowie.identity, ddc: devices[0])
@@ -85,13 +86,34 @@ public struct Diagnostics {
         try append(observation, to: observationURL)
         return observation
     }
-    public func readDell(config: Configuration? = nil) throws -> VCPReading {
+    public func readDell(config: Configuration? = nil, feature: UInt8 = 0x60) throws -> VCPReading {
         let config = try config ?? configuration()
         try config.validate()
-        let reading = try Subprocess.decoded(VCPReading.self, executable: helper, args: ["getvcp", "0x60", "--serial", config.ddc.serial, config.ddc.edid])
+        let reading = try Subprocess.decoded(VCPReading.self, executable: helper, args: ["getvcp", String(format: "0x%02x", feature), "--serial", config.ddc.serial, config.ddc.edid])
         guard reading.device.manufacturer == "DEL", reading.device.name == config.dell.name,
               reading.device.numericSerial == Int64(config.dell.serial),
               reading.device.serial == config.ddc.serial, reading.device.edid == config.ddc.edid else { throw BridgeError("DDC helper identity mismatch") }
+        if reading.valid, VCPReading.validate(raw: reading.raw, transportOK: true, feature: feature) != nil { throw BridgeError("DDC feature validation failed") }
+        return reading
+    }
+    public func readZowie(config: Configuration, feature: UInt8, device saved: DDCDevice? = nil) throws -> VCPReading {
+        try config.validate()
+        let device: DDCDevice
+        if let saved { device = saved }
+        else {
+            let devices = try Subprocess.decoded([DDCDevice].self, executable: helper, args: ["detect"])
+            let matches = devices.filter { $0.manufacturer == "BNQ" && $0.name == config.zowie.name && $0.numericSerial == Int64(config.zowie.serial) && $0.location == config.zowie.location }
+            guard matches.count == 1 else { throw BridgeError("Protected ZOWIE DDC identity unavailable") }
+            device = matches[0]
+        }
+        guard device.manufacturer == "BNQ", device.name == config.zowie.name,
+              device.numericSerial == Int64(config.zowie.serial), device.location == config.zowie.location,
+              !device.serial.isEmpty, !device.edid.isEmpty else { throw BridgeError("Protected ZOWIE DDC identity mismatch") }
+        let reading = try Subprocess.decoded(VCPReading.self, executable: helper, args: ["getvcp-zowie", String(format: "0x%02x", feature), "--serial", device.serial, device.edid])
+        guard reading.device.manufacturer == device.manufacturer, reading.device.name == device.name,
+              reading.device.numericSerial == device.numericSerial, reading.device.serial == device.serial,
+              reading.device.edid == device.edid else { throw BridgeError("ZOWIE DDC helper identity mismatch") }
+        if reading.valid, VCPReading.validate(raw: reading.raw, transportOK: true, feature: feature) != nil { throw BridgeError("ZOWIE DDC feature validation failed") }
         return reading
     }
     public func probeZowie(run: String) throws -> Observation {
@@ -143,7 +165,7 @@ public struct Diagnostics {
         func candidate(_ mode: String) -> Bool {
             ["usb-c", "hdmi"].allSatisfy { label in
                 guard let test = experiments.last(where: { $0.mode == mode && $0.label == label }),
-                      test.mutationObserved, (test.protectedUnchanged || test.protectedTimingAdjusted == true), test.restored, test.ddcReadable, test.error == nil,
+                      test.mutationObserved, (test.protectedUnchanged || test.protectedTimingAdjusted == true || test.protectedMainAdjusted == true), test.restored, test.ddcReadable, test.error == nil,
                       !test.readings.isEmpty else { return false }
                 let expected = label == "usb-c" ? usb : hdmi
                 var sequence = ReadingStability()
@@ -175,7 +197,7 @@ public struct Diagnostics {
     public func verifyRestored(_ saved: Recovery) throws {
         let dell = try Displays.resolve(saved.configuration.dell)
         try Safety.checkProtected(saved.zowie, try Displays.resolve(saved.configuration.zowie))
-        guard dell.active, !dell.inMirrorSet, dell.x == saved.dell.x, dell.y == saved.dell.y,
+        guard dell.active, !dell.inMirrorSet, dell.main == saved.dell.main, dell.x == saved.dell.x, dell.y == saved.dell.y,
               let old = saved.dell.mode, let current = dell.mode, old.equivalent(to: current) else {
             throw BridgeError("Dell layout restoration not verified. Recovery file retained; reconnect Dell USB-C or use Displays settings.")
         }
@@ -199,7 +221,10 @@ public struct Diagnostics {
         var during: [DisplayState] = [], readings: [Observation] = []
         var failure: String?
         var sequence = ReadingStability()
+        var protectedReference = saved.zowie
         do {
+            try Displays.setMainDisplay(.zowie, config: config)
+            protectedReference = try Displays.resolve(config.zowie)
             if mode == "disable" { try Displays.setDellEnabled(false, config: config) }
             else { try Displays.mirrorDell(config: config) }
             Thread.sleep(forTimeInterval: 2)
@@ -211,7 +236,7 @@ public struct Diagnostics {
             guard let protectedMode = saved.zowie.mode else { throw BridgeError("Missing protected display mode") }
             timingAdjusted = currentZowie.mode?.equivalent(to: protectedMode) != true
             if timingAdjusted { try Displays.restoreProtected(saved); Thread.sleep(forTimeInterval: 1) }
-            try Safety.checkProtected(saved.zowie, try Displays.resolve(config.zowie))
+            try Safety.checkProtected(protectedReference, try Displays.resolve(config.zowie))
             protected = true
             if mode == "disable" { observed = !during.contains { $0.identity.matches(config.dell) && $0.enabled } }
             else { let dell = try Displays.resolve(config.dell); let zowie = try Displays.resolve(config.zowie); observed = dell.inMirrorSet && dell.mirrorOf == zowie.id }
@@ -221,13 +246,14 @@ public struct Diagnostics {
                 let sample = try observe(label: label, phase: mode, run: saved.token)
                 readings.append(sample)
                 sequence.ingest(sample.reading?.valid == true && sample.error == nil ? sample.reading?.current : nil)
-                try Safety.checkProtected(saved.zowie, try Displays.resolve(config.zowie))
+                try Safety.checkProtected(protectedReference, try Displays.resolve(config.zowie))
                 if sequence.failed || sequence.stableValue != nil { break }
                 Thread.sleep(forTimeInterval: 1)
             } while ProcessInfo.processInfo.systemUptime < deadline
         } catch { failure = error.localizedDescription }
         do { try recover(); restored = true } catch { failure = [failure, "Recovery failed: \(error.localizedDescription)"].compactMap { $0 }.joined(separator: "; ") }
-        let result = Experiment(date: Date(), mode: mode, label: label, mutationObserved: observed, protectedUnchanged: protected && !timingAdjusted, protectedTimingAdjusted: timingAdjusted, ddcReadable: sequence.stableValue != nil, restored: restored, error: failure, before: saved, during: during, readings: readings)
+        let mainAdjusted = saved.zowie.main != protectedReference.main || saved.zowie.x != protectedReference.x || saved.zowie.y != protectedReference.y
+        let result = Experiment(date: Date(), mode: mode, label: label, mutationObserved: observed, protectedUnchanged: protected && !timingAdjusted && !mainAdjusted, protectedTimingAdjusted: timingAdjusted, protectedMainAdjusted: mainAdjusted, ddcReadable: sequence.stableValue != nil, restored: restored, error: failure, before: saved, during: during, readings: readings)
         try append(result, to: experimentsURL)
         return result
     }

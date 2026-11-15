@@ -21,6 +21,7 @@ public struct RuntimeStatus: Codable {
     public let protected: Bool
     public let value: UInt16?
     public let readError: String?
+    public var mainDisplay: MainDisplay? = nil
 }
 
 public struct RuntimeEvent: Codable {
@@ -95,16 +96,21 @@ public struct RuntimeController {
     public func status(readInput: Bool = true) throws -> RuntimeStatus {
         let config = try diagnostics.configuration()
         let displays = try Displays.list()
-        guard let zowie = displays.first(where: { config.zowie.matches($0.identity) }) else {
-            throw BridgeError("保護対象のZOWIEが見つかりません。配線を確認してください。")
-        }
         let dell = displays.first(where: { config.dell.matches($0.identity) })
-        let sourceProtected = zowie.active && zowie.main && zowie.mirrorOf == 0
+        guard let zowie = displays.first(where: { config.zowie.matches($0.identity) }) else {
+            let reading = readInput ? try? diagnostics.readDell(config: config) : nil
+            return RuntimeStatus(mode: .unavailable, zowieHz: nil, dellHz: dell?.mode?.refreshRate, protected: false,
+                                 value: reading?.valid == true ? reading?.current : nil, readError: reading?.error,
+                                 mainDisplay: dell?.main == true ? .dell : nil)
+        }
+        let extendedPair = dell?.active == true && dell?.inMirrorSet == false && dell?.mirrorOf == 0 && !zowie.inMirrorSet
+        let sourceProtected = zowie.active && zowie.mirrorOf == 0 &&
+            (zowie.main || (extendedPair && dell?.main == true))
         let owned = FileManager.default.fileExists(atPath: diagnostics.recoveryURL.path)
         let mode: WorkspaceMode
         if !sourceProtected { mode = .unavailable }
         else if let dell, dell.inMirrorSet, dell.mirrorOf == zowie.id { mode = .mirrored }
-        else if let dell, dell.active { mode = .dual }
+        else if extendedPair { mode = .dual }
         else if owned { mode = .single }
         else { mode = .unavailable }
         var value: UInt16?, readError: String?
@@ -115,7 +121,8 @@ public struct RuntimeController {
                 readError = reading.error
             } catch { readError = error.localizedDescription }
         }
-        return RuntimeStatus(mode: mode, zowieHz: zowie.mode?.refreshRate, dellHz: dell?.mode?.refreshRate, protected: sourceProtected, value: value, readError: readError)
+        return RuntimeStatus(mode: mode, zowieHz: zowie.mode?.refreshRate, dellHz: dell?.mode?.refreshRate, protected: sourceProtected, value: value, readError: readError,
+                             mainDisplay: zowie.main ? .zowie : dell?.main == true ? .dell : nil)
     }
 
     public func heartbeat() throws {
@@ -159,6 +166,10 @@ public struct RuntimeController {
         try JSON.save(saved, baselineURL)
         try arm(saved)
         do {
+            // Promote ZOWIE before hiding Dell, while the watchdog still retains
+            // the original extended layout and its main display for recovery.
+            try Displays.setMainDisplay(.zowie, config: config)
+            let protectedReference = try Displays.resolve(config.zowie)
             if strategy == .disable { try Displays.setDellEnabled(false, config: config) }
             else { try Displays.mirrorDell(config: config) }
             Thread.sleep(forTimeInterval: 1)
@@ -166,7 +177,7 @@ public struct RuntimeController {
             guard zowie.active, zowie.main, zowie.mirrorOf == 0 else { throw BridgeError("ZOWIEの表示状態が変化したため復旧します。") }
             try Displays.restoreProtected(saved)
             Thread.sleep(forTimeInterval: 0.4)
-            try Safety.checkProtected(saved.zowie, try Displays.resolve(config.zowie))
+            try Safety.checkProtected(protectedReference, try Displays.resolve(config.zowie))
             let state = try status(readInput: false)
             guard state.mode == (strategy == .disable ? .single : .mirrored) else { throw BridgeError("Dellの切替を確認できなかったため復旧します。") }
             try heartbeat()
@@ -195,6 +206,91 @@ public struct RuntimeController {
         try? FileManager.default.removeItem(at: leaseURL)
         log("dual", "Saved arrangement restored")
         return try status(readInput: false)
+    }
+
+    public func setMainDisplay(_ target: MainDisplay) throws -> RuntimeStatus {
+        let lock = try WorkspaceLock(root: root); defer { withExtendedLifetime(lock) {} }
+        guard !FileManager.default.fileExists(atPath: diagnostics.recoveryURL.path) else {
+            throw BridgeError("先にデュアル構成へ戻してからメイン画面を変更してください。")
+        }
+        let config = try diagnostics.configuration()
+        if let profile = try? JSON.load(CalibrationProfile.self, profileURL), profile.zowieMacInput?.verified == true {
+            let reading = try? diagnostics.readDell(config: config)
+            let available = try mainAvailability(dellInput: reading?.valid == true ? reading?.current : nil)
+            guard (target == .dell ? available.dell : available.zowie) == .available else {
+                throw BridgeError("切替先の画面がMacで使用できることを確認できません。設定を保持して再確認します。")
+            }
+        }
+        let before = try Recovery(config: config)
+        if (target == .dell ? before.dell.main : before.zowie.main) {
+            try JSON.save(before, baselineURL)
+            return try status(readInput: false)
+        }
+        try arm(before)
+        do {
+            try Displays.setMainDisplay(target, config: config)
+            let updated = try Recovery(config: config)
+            try JSON.save(updated, baselineURL)
+            try JSON.save(updated, root.appendingPathComponent("last-recovery.json"))
+            try FileManager.default.removeItem(at: diagnostics.recoveryURL)
+            try? FileManager.default.removeItem(at: leaseURL)
+            log("main-display", target.rawValue)
+            return try status(readInput: false)
+        } catch {
+            let original = error.localizedDescription
+            do {
+                try diagnostics.recover()
+                try JSON.save(before, baselineURL)
+                try? FileManager.default.removeItem(at: leaseURL)
+            } catch {
+                log("recovery-error", error.localizedDescription)
+                throw BridgeError("\(original) メイン画面の復旧にも失敗しました。Dellを復旧してください。")
+            }
+            throw BridgeError(original)
+        }
+    }
+
+    public func registerMainInput() throws -> CalibrationProfile {
+        let lock = try WorkspaceLock(root: root); defer { withExtendedLifetime(lock) {} }
+        let config = try diagnostics.configuration()
+        let zowie = try Displays.resolve(config.zowie)
+        guard zowie.active, zowie.mirrorOf == 0 else { throw BridgeError("Macが映っているZOWIEで登録してください。") }
+        var profile = try JSON.load(CalibrationProfile.self, profileURL)
+        guard profile.matches(config) else { throw BridgeError("入力の登録情報を確認してください。") }
+        var samples = ReadingStability()
+        var device: DDCDevice?
+        for _ in 0..<3 {
+            let reading = try diagnostics.readZowie(config: config, feature: 0x60, device: device)
+            device = reading.device
+            samples.ingest(reading.valid ? reading.current : nil)
+        }
+        let power = try diagnostics.readZowie(config: config, feature: 0xd6, device: device)
+        guard let value = samples.stableValue, power.valid, power.current == 1 else {
+            throw BridgeError("ZOWIEの入力・電源状態を確認できません。Mac表示中に再登録してください。")
+        }
+        profile.zowieMacInput = CalibrationPoint(value: value, verified: true)
+        profile.zowieDDC = device
+        try JSON.save(profile, profileURL)
+        log("main-input", "Protected display Mac input and power response verified")
+        return profile
+    }
+
+    public func mainAvailability(dellInput: UInt16?) throws -> MainAvailability {
+        let config = try diagnostics.configuration()
+        let profile = try JSON.load(CalibrationProfile.self, profileURL)
+        guard profile.matches(config) else { throw BridgeError("入力の登録情報を確認してください。") }
+        let displays = try Displays.list()
+        let dellOnline = displays.contains { config.dell.matches($0.identity) }
+        let zowieOnline = displays.contains { config.zowie.matches($0.identity) && $0.active }
+        let dellPower = try? diagnostics.readDell(config: config, feature: 0xd6)
+        let zowieInput = try? diagnostics.readZowie(config: config, feature: 0x60, device: profile.zowieDDC)
+        let zowiePower = try? diagnostics.readZowie(config: config, feature: 0xd6, device: profile.zowieDDC)
+        return MainAvailability(
+            dell: .classify(online: dellOnline, input: dellInput, macInput: profile.usbC?.verified == true ? profile.usbC?.value : nil,
+                            power: dellPower?.valid == true ? dellPower?.current : nil),
+            zowie: .classify(online: zowieOnline, input: zowieInput?.valid == true ? zowieInput?.current : nil,
+                             macInput: profile.zowieMacInput?.verified == true ? profile.zowieMacInput?.value : nil,
+                             power: zowiePower?.valid == true ? zowiePower?.current : nil))
     }
 
     public func saveStrategy(_ strategy: HideStrategy) throws -> CalibrationProfile {
@@ -231,7 +327,7 @@ public struct RuntimeController {
         var hiddenSequence = ReadingStability()
         for sample in result.readings { hiddenSequence.ingest(sample.reading?.valid == true ? sample.reading?.current : nil) }
         guard result.restored, result.mutationObserved, result.error == nil, result.ddcReadable,
-              result.protectedUnchanged || result.protectedTimingAdjusted == true,
+              result.protectedUnchanged || result.protectedTimingAdjusted == true || result.protectedMainAdjusted == true,
               hiddenSequence.stableValue == value else {
             throw BridgeError("非表示中の通信または復帰を確認できませんでした。\(result.error ?? "別の非表示方法を試すか、手動切替を使用してください。")")
         }
