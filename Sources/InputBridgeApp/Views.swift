@@ -156,6 +156,7 @@ struct SettingsContent: View {
                     Button { model.selectedTab = tab } label: {
                         Label(tab.title, systemImage: tab.symbol).font(.system(size: 12, weight: .medium))
                             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.vertical, 10)
+                            .contentShape(Rectangle())
                             .background(model.selectedTab == tab ? Color.blue.opacity(0.13) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
                             .foregroundColor(model.selectedTab == tab ? .blue : .primary)
                     }.buttonStyle(.plain).accessibilityIdentifier("tab-\(tab.rawValue)")

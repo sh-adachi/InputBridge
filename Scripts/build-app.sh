@@ -25,7 +25,7 @@ from pathlib import Path
 app = Path(sys.argv[1])
 info = {'CFBundleExecutable':'InputBridgeMenu', 'CFBundleIdentifier':'dev.adachi.InputBridge',
         'CFBundleName':'InputBridge', 'CFBundleDisplayName':'InputBridge', 'CFBundlePackageType':'APPL',
-        'CFBundleShortVersionString':'1.0.4', 'CFBundleVersion':'5', 'CFBundleIconFile':'AppIcon',
+        'CFBundleShortVersionString':'1.0.5', 'CFBundleVersion':'6', 'CFBundleIconFile':'AppIcon',
         'CFBundleDevelopmentRegion':'ja', 'LSMinimumSystemVersion':'13.0', 'LSUIElement':False,
         'NSHighResolutionCapable':True, 'NSSupportsAutomaticTermination':False,
         'NSSupportsSuddenTermination':False, 'LSApplicationCategoryType':'public.app-category.utilities',
